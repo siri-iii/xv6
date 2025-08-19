@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "vma.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -289,7 +290,7 @@ sys_open(void)
   char path[MAXPATH];
   int fd, omode;
   struct file *f;
-  struct inode *ip, *oldip;
+  struct inode *ip;
   int n;
 
   if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
@@ -315,26 +316,12 @@ sys_open(void)
       return -1;
     }
   }
-  
-  
-  int cnt = 0;
-  while(ip->type == T_SYMLINK && cnt < 10 && !(omode & O_NOFOLLOW)){
-       oldip = ip;
-       if(readi(ip,0,(uint64)path,0,ip->size) != ip->size || (ip = namei(path)) == 0){
-           iunlockput(oldip);
-           end_op();
-           return -1;
-       }
-       iunlockput(oldip);
-       ilock(ip);
-       cnt++;
-   }
- 
-   if(cnt == 10){
-       iunlockput(ip);
-       end_op();
-       return -1;
-   }
+
+  if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
 
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
     if(f)
@@ -498,34 +485,96 @@ sys_pipe(void)
   }
   return 0;
 }
-
-
-
+//add by lab10
 
 uint64
-sys_symlink(void){
-     char target[MAXPATH], path[MAXPATH];
-     struct inode *ip;
- 
-     if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
-         return -1;
- 
-     begin_op();
-     if((ip = create(path,T_SYMLINK,0,0)) == 0){
-         end_op();
-         return -1;
-     }
- 
-     if(writei(ip, 0, (uint64)target, 0, strlen(target)) != strlen(target)){
-         end_op();
-         return -1;
-     }
-     end_op();
-     iunlockput(ip);
-     return 0;
- }
+sys_mmap(void)
+{
+  struct vm_area_struct *vmap;
+  struct proc *pr;
+  int length,prot,flags,fd,i;
+  uint64 sz;
 
+  if(argint(1,&length)<0 || argint(2,&prot)<0 ||
+  argint(3,&flags)<0 || argint(4,&fd)<0){
+    return 0xffffffffffffffff;
+  }
+  pr=myproc();
+  if(!pr->ofile[fd]->readable){
+    if(prot & PROT_READ)
+      return 0xffffffffffffffff;
+  }
+  if(!pr->ofile[fd]->writable){
+    if(prot&PROT_WRITE&&flags==MAP_SHARED)
+      return 0xffffffffffffffff;
+  }
 
+  if((vmap=vma_alloc())==0){
+    return 0xffffffffffffffff;
+  }
 
+  acquire(&pr->lock);
+  for(i=0;i<NOFILE;i++){
+    if(pr->areaps[i]==0){
+      pr->areaps[i]=vmap;
+      release(&pr->lock);
+      break;
+    }
+  }
+  if(i==NOFILE){
+    return 0xffffffffffffffff;
+  }
+  sz=pr->sz;
+  if(lazy_grow_proc(length)<0){
+    return 0xffffffffffffffff;
+  }
 
+  vmap->addr=(char *)sz;
+  vmap->length=length;
+  vmap->prot=(prot & PROT_READ) | (prot & PROT_WRITE);
+  vmap->flags=flags;
+  vmap->file=pr->ofile[fd];
+  filedup(pr->ofile[fd]);
+  return sz;
+}
 
+uint64
+sys_munmap(void)
+{
+  struct proc *pr=myproc();
+  int startAddr,length;
+
+  if(argint(0,&startAddr)<0 || argint(1,&length)<0){
+    return -1;
+  }
+
+  for(int i=0;i<NOFILE;i++){
+    if(pr->areaps[i]==0)
+      continue;
+    if((uint64)pr->areaps[i]->addr==startAddr){
+      if(length>=pr->areaps[i]->length){
+        length = pr->areaps[i]->length;
+      }
+      if(pr->areaps[i]->prot & PROT_WRITE && 
+      pr->areaps[i]->flags==MAP_SHARED){
+        begin_op();
+        ilock(pr->areaps[i]->file->ip);
+        writei(pr->areaps[i]->file->ip,1,(uint64)startAddr,0,length);
+        iunlock(pr->areaps[i]->file->ip);
+        end_op();
+      }
+      uvmunmap(pr->pagetable,(uint64)startAddr,length/PGSIZE,1);
+      if(length==pr->areaps[i]->length){
+        fileclose(pr->areaps[i]->file);
+        vma_free(pr->areaps[i]);
+        pr->areaps[i]=0;
+        return 0;
+      }else{
+        pr->areaps[i]->addr+=length;
+        pr->areaps[i]->length-=length;
+        return 0;
+      }
+    }
+  }
+  return -1;
+}
